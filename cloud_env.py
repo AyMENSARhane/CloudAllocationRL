@@ -16,10 +16,8 @@ class CloudResourceEnv(gym.Env):
         super(CloudResourceEnv, self).__init__()
         
         if workload_gen is None:
-            # Si aucun générateur n'est fourni, crée un générateur par défaut
             self.workload_gen = WorkloadGenerator()
         else:
-            # Utilise l'instance fournie (injection de dépendances)
             self.workload_gen = workload_gen
 
         # --- Configuration Parameters ---
