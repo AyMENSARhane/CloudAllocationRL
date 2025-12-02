@@ -1,164 +1,250 @@
 import gymnasium as gym
-import numpy as np
 from gymnasium import spaces
-from workload_generator import WorkloadGenerator
+import numpy as np
+import pandas as pd
+import math
+from typing import Optional 
+
+# --- Environment Constants and Hyperparameters ---
+# Base unit capacity for one abstract 'instance' or 'core'
+CPU_PER_UNIT = 10.0   # 10 normalized CPU units per capacity unit
+MEM_PER_UNIT = 8.0    # 8 normalized Memory units per capacity unit
+
+# Minimum and Maximum capacity boundaries (to prevent infinite scaling)
+MIN_CAPACITY = 2      # Minimum active units (20 CPU, 16 MEM)
+MAX_CAPACITY = 50     # Maximum active units (500 CPU, 400 MEM)
+
+# Hyperparameters for the Reward Function
+ALPHA_SLA = 0.001    # High penalty for SLA violation (prioritize performance)
+BETA_COST = 0.5       # Moderate penalty for resource cost (minimize waste)
+GAMMA_STABILITY = 0.1 # Small penalty for aggressive scaling (encourage stability)
+
+# Scaling Dynamics
+MAX_SCALING_STEP = 5  # Max units to add/remove in one step (based on action)
+SCALING_DELAY_STEPS = 2 # Scaling action takes effect after 2 steps (Sim2Real feature)
+
 
 class CloudResourceEnv(gym.Env):
     """
-    Custom Environment for Dynamic Resource Allocation with Queueing Model.
-    The number of instances corresponds to the number of active CPU cores.
-    
-    Observation Space (s_t): [CPU%, Memory%, Latency, InstanceCount, PendingRequests]
-    Action Space (a_t): Continuous value [-1, 1] for scaling.
+    A custom Gymnasium environment for dynamic cloud resource allocation 
+    using the Google Cluster trace as the external demand signal.
     """
+    metadata = {'render_modes': ['human'], 'render_fps': 1}
 
-    def __init__(self , workload_gen = None):
+    def __init__(self, workload_trace: pd.DataFrame, render_mode: Optional[str] = None):
         super(CloudResourceEnv, self).__init__()
+
+        # --- Workload Trace Integration ---
+        self.workload_trace = workload_trace
+        self.total_steps = len(workload_trace)
+        self.render_mode = render_mode
+
+        # --- State and Action Space Definition ---
         
-        if workload_gen is None:
-            self.workload_gen = WorkloadGenerator()
-        else:
-            self.workload_gen = workload_gen
-
-        # --- Configuration Parameters ---
-        self.min_instances = 1
-        self.max_instances = 25
-        self.sla_latency_limit = 200  # ms (SLA Threshold)
-        self.request_per_instance = 100 # RPS capacity of 1 CPU core
-
-        # Reward weights (Alpha and Beta from the paper, Section 2)
-        self.alpha = 1.5  # Higher penalty for SLA violation (strong incentive)
-        self.beta = 0.5   # Cost importance
-        self.base_latency = 50 # ms
-
-        self.current_step = 0
-        self.max_steps = 1000 
-
-        # --- Internal State for Queueing ---
-        self.pending_requests = 0.0 # Requests accumulated from past steps (the queue)
-        self.current_instances = 5
-        
-        # --- Action Space ---
+        # Action Space: Continuous value [-1.0, 1.0] for scaling factor
+        # -1.0 means max scale-down, 1.0 means max scale-up
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
 
-        # --- Observation Space ---
-        # Vector: [CPU%, Mem%, Latency, InstanceCount, PendingRequests]
+        # Observation Space (State s_t): A vector of 6 metrics
+        # [CPU_Demand, MEM_Demand, CPU_Utilization, MEM_Utilization, CPU_Capacity, MEM_Capacity]
         self.observation_space = spaces.Box(
-            low=np.array([0, 0, 0, 0, 0]),
-            high=np.array([100, 100, 5000, self.max_instances, 5000]), # Max 5000 pending requests
+            low=0.0, high=np.inf, 
+            shape=(6,), 
             dtype=np.float32
         )
 
-        self.state = None
+        # --- Internal Environment Variables ---
+        self.current_step = 0
+        self.current_units = MIN_CAPACITY # Number of active abstract units
+        
+        # Resource tracking (used to model scaling delay)
+        self.units_provisioning = [] # Stores pending capacity changes
+        
+        # Internal state metrics
+        self.cpu_capacity = self.current_units * CPU_PER_UNIT
+        self.mem_capacity = self.current_units * MEM_PER_UNIT
+
+        # History for debugging/rendering
+        self.history = []
+
+    def _get_obs(self):
+        """Helper to construct the current observation vector."""
+        if self.current_step >= self.total_steps:
+             # If simulation is over, return padded zeros
+             return np.zeros(6, dtype=np.float32)
+
+        # Get demand for the current step from the workload trace
+        data = self.workload_trace.iloc[self.current_step]
+        
+        demand_cpu = data['total_cpu_demand']
+        demand_mem = data['total_mem_demand']
+        
+        # Calculate utilization (usage is capped at 1.0, or 100%)
+        util_cpu = np.clip(demand_cpu / self.cpu_capacity, 0.0, 1.0) if self.cpu_capacity > 0 else 1.0
+        util_mem = np.clip(demand_mem / self.mem_capacity, 0.0, 1.0) if self.mem_capacity > 0 else 1.0
+
+        return np.array([
+            demand_cpu, 
+            demand_mem, 
+            util_cpu, 
+            util_mem, 
+            self.cpu_capacity, 
+            self.mem_capacity
+        ], dtype=np.float32)
+
+    def _apply_action(self, action):
+        """
+        Processes the agent's action and schedules the capacity change.
+        Action is a scaling factor [-1.0, 1.0].
+        """
+        # Determine the target change in units based on the continuous action
+        unit_change = int(action[0] * MAX_SCALING_STEP)
+        
+        target_units = np.clip(
+            self.current_units + unit_change, 
+            MIN_CAPACITY, 
+            MAX_CAPACITY
+        )
+        
+        # Calculate the actual change to provision
+        actual_change = target_units - self.current_units
+        
+        if actual_change != 0:
+            # Schedule the change to occur after the delay
+            provision_step = self.current_step + SCALING_DELAY_STEPS
+            self.units_provisioning.append((provision_step, actual_change))
+            
+        # Penalize aggressive scaling regardless of outcome
+        stability_penalty = GAMMA_STABILITY * abs(unit_change)
+        return stability_penalty
+
+    def _apply_provisioning(self):
+        """Applies pending capacity changes that have passed their delay time."""
+        
+        new_provisioning = []
+        capacity_change = 0
+        
+        for step, change in self.units_provisioning:
+            if self.current_step >= step:
+                capacity_change += change
+            else:
+                new_provisioning.append((step, change))
+        
+        self.units_provisioning = new_provisioning
+        
+        # Apply the change and clip to ensure boundaries are respected
+        self.current_units = np.clip(
+            self.current_units + capacity_change, 
+            MIN_CAPACITY, 
+            MAX_CAPACITY
+        )
+        
+        # Update physical capacities
+        self.cpu_capacity = self.current_units * CPU_PER_UNIT
+        self.mem_capacity = self.current_units * MEM_PER_UNIT
+
+    def _calculate_reward(self, demand_cpu, demand_mem):
+        """Calculates the reward based on cost and SLA penalties."""
+        
+        # 1. Resource Cost Penalty
+        cost_penalty = BETA_COST * self.current_units
+        
+        # 2. SLA Violation Penalty
+        # Violation occurs if demand exceeds capacity for either CPU or Memory
+        
+        # CPU Violation: max(0, Demand - Capacity)
+        cpu_violation = max(0, demand_cpu - self.cpu_capacity)
+        
+        # Memory Violation: max(0, Demand - Capacity)
+        mem_violation = max(0, demand_mem - self.mem_capacity)
+        
+        # The penalty is based on the worse violation (the bottleneck resource)
+        # We use the square to harshly penalize large shortfalls.
+        sla_penalty = ALPHA_SLA * (cpu_violation**2 + mem_violation**2)
+        
+        # Total Reward: Goal is to maximize (i.e., minimize negative penalties)
+        total_penalty = cost_penalty + sla_penalty
+        reward = -total_penalty
+        
+        return reward, cost_penalty, sla_penalty
+
+    # --- Core Gym Methods ---
 
     def step(self, action):
         """
-        Execute one time step within the environment, processing workload and updating state.
+        The agent performs an action, the environment transitions to a new state.
         """
+        # 1. Check if the episode is finished
+        if self.current_step >= self.total_steps - 1:
+            return self._get_obs(), 0.0, True, False, {}
+
+        # 2. Apply Agent's Action and get scaling penalty
+        stability_penalty = self._apply_action(action)
+        
+        # 3. Advance to the next time step
         self.current_step += 1
         
-        # 1. APPLY ACTION (Scaling)
-        scaling_action = int(action * 5) # Scale up/down by up to 5 cores
-        self.current_instances = np.clip(
-            self.current_instances + scaling_action, 
-            self.min_instances, 
-            self.max_instances
-        )
+        # 4. Apply capacity changes that are due (handling the scaling delay)
+        self._apply_provisioning()
 
-        # 2. CALCULATE WORKLOAD AND CAPACITY
-        current_arrival = self.workload_gen.get_workload(self.current_step)
+        # 5. Get NEW State and Demand at t+1
+        obs = self._get_obs()
         
-        # Total work is incoming requests PLUS previously pending requests (the queue)
-        total_work_to_process = current_arrival + self.pending_requests
-        total_capacity = self.current_instances * self.request_per_instance
+        # Extract the demand data for the reward calculation
+        data = self.workload_trace.iloc[self.current_step - 1] # Use data from the step just completed
+        demand_cpu = data['total_cpu_demand']
+        demand_mem = data['total_mem_demand']
         
-        # 3. PROCESS WORK & UPDATE QUEUE
-        
-        # Work that the CPU cores successfully process in this step
-        work_processed = min(total_work_to_process, total_capacity)
-        
-        # Work that remains in the queue for the next step
-        self.pending_requests = max(0, total_work_to_process - total_capacity)
+        # 6. Calculate Reward
+        reward, cost, sla_pen = self._calculate_reward(demand_cpu, demand_mem)
+        reward -= stability_penalty # Apply stability penalty here
 
-        # 4. SIMULATE SYSTEM METRICS
-        
-        # CPU Usage (Utilization is based on the actual work done vs total capacity)
-        utilization_ratio = work_processed / total_capacity if total_capacity > 0 else 1.0
-        cpu_usage = utilization_ratio * 100.0
-        
-        # Memory usage (Simplification: correlated to CPU in a Mono-CPU scenario)
-        mem_usage = min(100.0, cpu_usage * 0.8 + np.random.normal(0, 5))
-        
-        # Latency Simulation (Now highly sensitive to utilization AND queue size)
-        
-        # Latency due to CPU saturation (as utilization approaches 100%)
-        latency_cpu_saturation = self.base_latency / (1.001 - utilization_ratio)
-        
-        # Latency due to Queue backlog (time spent waiting in line)
-        latency_queue_backlog = self.pending_requests * 0.1 # Simple model: 0.1ms per request in queue
-        
-        latency = latency_cpu_saturation + latency_queue_backlog
-        latency = min(5000, latency) # Cap latency
-
-        # Update State [CPU, Mem, Latency, Instances, PendingRequests]
-        self.state = np.array([cpu_usage, mem_usage, latency, self.current_instances, self.pending_requests], dtype=np.float32)
-
-        # 5. CALCULATE REWARD (r_t)
-        
-        # SLA Penalty: non-zero only if latency > threshold
-        sla_penalty = max(0, latency - self.sla_latency_limit)
-        
-        # Cost: Linear cost per running instance (CPU core)
-        resource_cost = self.current_instances
-        
-        # r = - (alpha * SLA_violations + beta * Resource_Cost)
-        self.reward = - (self.alpha * sla_penalty + self.beta * resource_cost)
-
-        # 6. CHECK TERMINATION
-        terminated = self.current_step >= self.max_steps
+        # 7. Check for termination
+        # Terminate if the agent fails to provision resources for too long (Optional)
+        terminated = False 
         truncated = False
-
+        
         info = {
-            "workload": current_arrival,
-            "sla_violations": 1 if latency > self.sla_latency_limit else 0,
-            "reward": self.reward 
+            "cost_penalty": cost,
+            "sla_penalty": sla_pen,
+            "total_demand_cpu": demand_cpu,
+            "current_units": self.current_units
         }
 
-        return self.state, self.reward, terminated, truncated, info
+        # Store history for visualization in Dash later
+        self.history.append({
+            "cost_penalty": cost,
+            "sla_penalty": sla_pen,
+            "total_demand_cpu": demand_cpu,
+            "current_units": self.current_units,
+            "step": self.current_step, 
+            "reward": reward # <--- This key MUST be present
+        })
+        return obs, reward, terminated, truncated, info
 
-    def reset(self, seed=None, options=None):
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         """
-        Reset the environment to an initial state for a new episode.
+        Resets the environment to the starting state for a new episode.
         """
         super().reset(seed=seed)
-        self.workload_gen.reset()
+        
         self.current_step = 0
-        self.current_instances = 5 # Start with 5 CPU cores
-        self.pending_requests = 0.0 # Queue must be empty at start
-        
-        # Initial state: [CPU, Mem, Latency, Instances, PendingRequests]
-        self.state = np.array([50.0, 40.0, 60.0, 5.0, 0.0], dtype=np.float32)
-        self.reward = 0.0
-        
-        return self.state, {}
+        self.current_units = MIN_CAPACITY
+        self.cpu_capacity = self.current_units * CPU_PER_UNIT
+        self.mem_capacity = self.current_units * MEM_PER_UNIT
+        self.units_provisioning = []
+        self.history = []
 
+        observation = self._get_obs()
+        info = {}
+        return observation, info
+
+    # Optional: Render mode function (can be implemented later for Dash visualization)
     def render(self):
-        """
-        Renders the current state of the environment for debugging and visualization.
-        """
-        if self.state is None:
-            return 
-            
-        cpu, mem, latency, instances, pending = self.state
+        if self.render_mode == 'human':
+            # This is where you would print or plot the current state
+            pass
 
-        # Check for SLA violation
-        sla_status = " SLA VIOLATION" if latency > self.sla_latency_limit else "✅ OK"
-        
-        print(f"\n--- TIME STEP {self.current_step} / {self.max_steps} ---")
-        print(f" Reward: {self.reward:.2f}")
-        print(f"Core Count: {instances:.0f} CPU(s) / Capacity: {instances * self.request_per_instance:.0f} RPS")
-        print(f"==================================================")
-        print(f"CPU Usage: {cpu:.1f}%")
-        print(f"Latency: {latency:.1f} ms ({sla_status})")
-        print(f"Pending Queue: {pending:.0f} requests")
-        print("--------------------------------------------------")
+    def close(self):
+        # Clean up any resources (e.g., plot windows)
+        pass
