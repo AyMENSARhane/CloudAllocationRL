@@ -6,7 +6,7 @@ import numpy as np
 from workload_generator import WorkloadGenerator
 
 # --- Default path 
-DEFAULT_MODEL_PATH = "training_sessions/2025-11-26_16h08m04s/models/final_ppo_autoscaler_model.zip"
+DEFAULT_MODEL_PATH = "training_sessions/2025-11-30_18h38m39s/models/final_ppo_autoscaler_model.zip"
 
 # ----------------------------------------------------------------------
 # 1. TEST EXECUTION FUNCTION
@@ -30,7 +30,7 @@ def run_test_simulation(model_path: str, num_steps: int = 20):
         return
 
     # 2. Initialize the environment for testing
-    Workload = WorkloadGenerator(amplitude= 1500)
+    Workload = WorkloadGenerator()
     test_env = CloudResourceEnv(Workload)
     obs, _ = test_env.reset()
 

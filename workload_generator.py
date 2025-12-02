@@ -18,7 +18,7 @@ class WorkloadGenerator:
         Formula: Base + Sine Wave (Trend) + Gaussian Noise (Randomness)
         """
         # Sinusoidal trend to mimic daily traffic peaks
-        trend = self.amplitude * np.sin(2 * np.pi * t / 200) + 1000
+        trend = self.amplitude * np.sin(2 * np.pi * t / 200) 
         
         # Random noise to mimic unpredictability
         noise = np.random.normal(0, self.noise_level)
