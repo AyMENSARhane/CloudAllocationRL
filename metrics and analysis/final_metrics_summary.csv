@@ -1,0 +1,4 @@
+Agent,SLA Violation (%),Avg Latency (ms),Avg Cost (Instances),Avg Queue Size,Stability (Std Dev)
+Baseline (Threshold),43.60,1881.54,12.76,5585.00,8.01
+PPO Agent,25.60,1267.81,18.77,6054.78,4.08
+SAC Agent,25.40,1232.83,16.81,5152.26,6.18

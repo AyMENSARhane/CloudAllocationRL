@@ -17,13 +17,8 @@ class WorkloadGenerator:
         Returns the number of requests at time step t.
         Formula: Base + Sine Wave (Trend) + Gaussian Noise (Randomness)
         """
-        # Sinusoidal trend to mimic daily traffic peaks
         trend = self.amplitude * np.sin(2 * np.pi * t / 200) 
-        
-        # Random noise to mimic unpredictability
         noise = np.random.normal(0, self.noise_level)
-        
-        # Ensure workload is never negative
         load = max(10, self.base_load + trend + noise)
         return load
 

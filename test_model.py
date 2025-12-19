@@ -6,7 +6,7 @@ import numpy as np
 from workload_generator import WorkloadGenerator
 
 # --- Default path 
-DEFAULT_MODEL_PATH = "training_sessions/2025-11-30_18h38m39s/models/final_ppo_autoscaler_model.zip"
+DEFAULT_MODEL_PATH = "training_sessions/2025-11-30_18h38m39s /models/final_ppo_autoscaler_model.zip"
 
 # ----------------------------------------------------------------------
 # 1. TEST EXECUTION FUNCTION
